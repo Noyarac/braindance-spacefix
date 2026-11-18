@@ -1,0 +1,506 @@
+#!/usr/bin/env python3
+"""
+braindance-spacefix - make Braindance's download pre-flight space check work
+under Wine/Proton, on any machine.
+
+Why it is needed
+----------------
+Braindance (Tauri/Rust) asks the native crate `sysinfo` for disk information.
+On Windows sysinfo enumerates volumes via FindFirstVolumeW() and then calls
+GetDriveTypeW("\\\\?\\Volume{...}\\").  Wine returns DRIVE_UNKNOWN (0) for those
+volume-GUID paths, while sysinfo only accepts DRIVE_FIXED (3) or
+DRIVE_REMOVABLE (2).  The disk list therefore ends up empty, and the app's
+`get_available_disk_space` / `get_total_disk_space` commands return 0, so every
+download is refused with "Not enough space to download the scene".
+
+What this script does
+---------------------
+The app's web UI is embedded in Braindance.exe as brotli-compressed assets.
+This script finds the JS bundle that contains the two IPC wrappers
+
+    async function XXX(e){return await F("get_available_disk_space",{path:e})}
+    async function YYY(e){return await F("get_total_disk_space",{path:e})}
+
+and replaces their bodies with the free/total bytes of the filesystem where the
+app actually stores its downloads (read with df(1) on the Linux side).  The
+compressed asset is rewritten in place, so nothing else in the app changes.
+
+Usage
+-----
+    braindance-spacefix                          # auto-detect exe + prefix
+    braindance-spacefix --exe /path/Braindance.exe --prefix /path/pfx
+    braindance-spacefix --exe ... --space-path /mnt/bigdisk
+    braindance-spacefix --revert                 # restore the original exe
+    braindance-spacefix --dry-run                # show what would be done
+
+All options can also be given through environment variables:
+BD_EXE, BD_PREFIX, BD_SPACE_PATH, BD_STEAM (see --help).
+"""
+
+import argparse
+import glob
+import json
+import os
+import re
+import shutil
+import struct
+import subprocess
+import sys
+from pathlib import Path
+
+try:
+    import brotli
+except ImportError:
+    sys.exit("error: the python module 'brotli' is required "
+             "(pip install brotli / apt install python3-brotli)")
+
+APP_DATA_MARKER = "ai.braindance.app"
+BACKUP_SUFFIX = ".spacefix-backup"
+
+TAG_AVAIL = "/*bd-spacefix:avail*/"
+TAG_TOTAL = "/*bd-spacefix:total*/"
+
+# exact shapes emitted by the app's bundler (names are minified, arg may differ)
+RE_AVAIL = re.compile(
+    r'async function (\w+)\((\w+)\)\{return await F\("get_available_disk_space",\{[^}]*\}\)\}'
+)
+RE_TOTAL = re.compile(
+    r'async function (\w+)\((\w+)\)\{return await F\("get_total_disk_space",\{[^}]*\}\)\}'
+)
+RE_PATCHED_AVAIL = re.compile(r'\{return \d+' + re.escape(TAG_AVAIL) + r'\}')
+RE_PATCHED_TOTAL = re.compile(r'\{return \d+' + re.escape(TAG_TOTAL) + r'\}')
+
+
+# --------------------------------------------------------------------------
+# PE helpers
+# --------------------------------------------------------------------------
+
+class PE:
+    def __init__(self, data, name="executable"):
+        self.data = data
+        e = struct.unpack_from("<I", data, 0x3C)[0]
+        if data[e:e + 4] != b"PE\0\0":
+            raise SystemExit(f"error: {name} is not a PE (Windows) executable")
+        coff = e + 4
+        nsec = struct.unpack_from("<H", data, coff + 2)[0]
+        optsz = struct.unpack_from("<H", data, coff + 16)[0]
+        opt = coff + 20
+        self.imagebase = struct.unpack_from("<Q", data, opt + 24)[0]
+        self.sections = []
+        so = opt + optsz
+        for i in range(nsec):
+            o = so + 40 * i
+            vsize, vaddr, rawsize, rawptr = struct.unpack_from("<IIII", data, o + 8)
+            self.sections.append((vaddr, vsize, rawptr, rawsize))
+
+    def rva2off(self, rva):
+        for va, vsize, rawptr, rawsize in self.sections:
+            if va <= rva < va + max(vsize, rawsize):
+                return rawptr + (rva - va)
+        return None
+
+    def off2rva(self, off):
+        for va, vsize, rawptr, rawsize in self.sections:
+            if rawptr <= off < rawptr + rawsize:
+                return va + (off - rawptr)
+        return None
+
+
+ASSET_SUFFIXES = (b".js", b".css", b".html", b".json", b".png", b".svg",
+                  b".woff2", b".wasm", b".mp3")
+
+
+def asset_table(pe, data):
+    """All Tauri asset entries found in the executable.
+
+    Each entry is (key, entry_offset, blob_offset, blob_len).  The table is
+    scanned structurally (key pointer, key length, data pointer, data length)
+    rather than by guessing key addresses, so the blob layout -- and therefore
+    the free space after a blob -- is reliable.
+    """
+    entries = []
+    seen = set()
+    for _va, _vsize, rawptr, rawsize in pe.sections:
+        for off in range(rawptr, rawptr + rawsize - 32, 8):
+            kptr, klen, dptr, dlen = struct.unpack_from("<QQQQ", data, off)
+            if not (4 < klen < 300 and 0 < dlen < 64 * 1024 * 1024):
+                continue
+            if kptr < pe.imagebase or dptr < pe.imagebase:
+                continue
+            koff = pe.rva2off(kptr - pe.imagebase)
+            if koff is None:
+                continue
+            key = bytes(data[koff:koff + klen])
+            if not key.startswith(b"/assets/") or not key.endswith(ASSET_SUFFIXES):
+                continue
+            doff = pe.rva2off(dptr - pe.imagebase)
+            if doff is None:
+                continue
+            sig = (key, doff)
+            if sig in seen:
+                continue
+            seen.add(sig)
+            entries.append((key, off, doff, dlen, koff))
+    return entries
+
+
+def find_asset(pe, data):
+    """Locate the JS bundle holding the disk-space IPC wrappers.
+
+    Returns (entry_offset, key, blob_offset, blob_len, slot_capacity, js_bytes)
+    or None.  Works both on a pristine executable and on an already patched one
+    (recognised by our inline tags).
+    """
+    entries = asset_table(pe, data)
+    # asset key strings are packed right after the previous blob, so the usable
+    # slot ends at the next blob *or* at the next key string, whichever is first
+    occupied = sorted({o for e in entries for o in (e[2], e[4])})
+
+    for key, entry_off, doff, dlen, koff in entries:
+        if not key.endswith(b".js"):
+            continue
+        try:
+            js = brotli.decompress(data[doff:doff + dlen])
+        except Exception:
+            continue
+        if b"__TAURI_INTERNALS__" not in js:
+            continue
+        if b"get_available_disk_space" not in js and TAG_AVAIL.encode() not in js:
+            continue
+        later = [o for o in occupied if o > doff]
+        capacity = (min(later) - doff) if later else dlen
+        return entry_off, key, doff, dlen, capacity, js
+    return None
+
+
+# --------------------------------------------------------------------------
+# discovery helpers
+# --------------------------------------------------------------------------
+
+def df_bytes(path):
+    avail = int(subprocess.check_output(
+        ["df", "-B1", "--output=avail", path], text=True).strip().splitlines()[-1])
+    total = int(subprocess.check_output(
+        ["df", "-B1", "--output=size", path], text=True).strip().splitlines()[-1])
+    return avail, total
+
+
+def steam_libraries(extra_root=None):
+    """Every <library>/steamapps directory we can find."""
+    home = os.path.expanduser("~")
+    roots = {
+        os.path.join(home, ".steam", "steam"),
+        os.path.join(home, ".local", "share", "Steam"),
+        os.path.join(home, ".var", "app", "com.valvesoftware.Steam", ".local", "share", "Steam"),
+    }
+    if extra_root:
+        roots.add(os.path.abspath(extra_root))
+
+    libs = set()
+    for root in roots:
+        root = os.path.realpath(root)
+        if not os.path.isdir(root):
+            continue
+        sa = os.path.join(root, "steamapps")
+        if os.path.isdir(sa):
+            libs.add(os.path.realpath(sa))
+        vdf = os.path.join(sa, "libraryfolders.vdf")
+        if not os.path.isfile(vdf):
+            continue
+        try:
+            text = open(vdf, encoding="utf-8", errors="replace").read()
+        except OSError:
+            continue
+        for m in re.finditer(r'"path"\s*"([^"]+)"', text):
+            lib = os.path.join(m.group(1).replace("\\\\", "\\"), "steamapps")
+            if os.path.isdir(lib):
+                libs.add(os.path.realpath(lib))
+    return sorted(libs)
+
+
+def find_prefixes(extra_root=None):
+    """Proton prefixes that contain this app's data directory."""
+    found = {}
+    for lib in steam_libraries(extra_root):
+        pattern = os.path.join(lib, "compatdata", "*", "pfx", "drive_c", "users", "*",
+                               "AppData", "Roaming", APP_DATA_MARKER)
+        for hit in glob.glob(pattern):
+            # .../pfx/drive_c/users/<user>/AppData/Roaming/ai.braindance.app
+            prefix = Path(hit).parents[5].resolve()
+            if prefix.is_dir():
+                found[str(prefix)] = prefix
+    return [found[k] for k in sorted(found)]
+
+
+def check_exe(path, hint):
+    path = os.path.abspath(os.path.expanduser(path))
+    if not os.path.isfile(path):
+        raise SystemExit(f"error: executable not found: {path}\n{hint}")
+    return path
+
+
+def resolve_exe(value, steam_root=None):
+    if value:
+        return check_exe(value, "       (from --exe)")
+    from_env = os.environ.get("BD_EXE")
+    if from_env:
+        return check_exe(from_env, "       (from $BD_EXE)")
+
+    if os.path.isfile("Braindance.exe"):
+        return os.path.abspath("Braindance.exe")
+
+    hits = []
+    for lib in steam_libraries(steam_root or os.environ.get("BD_STEAM")):
+        pattern = os.path.join(lib, "common", "*", "Braindance.exe")
+        hits.extend(sorted(h for h in glob.glob(pattern) if os.path.isfile(h)))
+    hits = sorted({os.path.realpath(h) for h in hits})
+
+    if len(hits) == 1:
+        return hits[0]
+    if len(hits) > 1:
+        listing = "\n".join(f"         {h}" for h in hits)
+        raise SystemExit("error: several Braindance.exe found, please pick one:\n"
+                         f"{listing}\n"
+                         "       pass --exe /path/to/Braindance.exe")
+    raise SystemExit("error: could not find Braindance.exe\n"
+                     "       run this from the game folder, or pass --exe /path/to/Braindance.exe")
+
+
+def app_running(exe):
+    """True if any process currently has this executable mapped (Wine included)."""
+    target = os.path.realpath(exe)
+    for p in glob.glob("/proc/[0-9]*/maps"):
+        try:
+            with open(p, encoding="utf-8", errors="replace") as f:
+                if target in f.read():
+                    return True
+        except OSError:
+            continue
+    return False
+
+
+def resolve_prefix(value, steam_root):
+    if not value:
+        value = os.environ.get("BD_PREFIX")
+    if value:
+        path = os.path.abspath(os.path.expanduser(value))
+        if not os.path.isdir(path):
+            raise SystemExit(f"error: Proton prefix not found: {path}")
+        if not os.path.isdir(os.path.join(path, "drive_c")):
+            raise SystemExit(f"error: {path} does not look like a Proton prefix "
+                             f"(no drive_c directory)")
+        return Path(path)
+
+    found = find_prefixes(steam_root or os.environ.get("BD_STEAM"))
+    if len(found) == 1:
+        return found[0]
+    if not found:
+        raise SystemExit(
+            "error: could not auto-detect the Proton prefix that contains\n"
+            f"       {APP_DATA_MARKER}.\n"
+            "       pass --prefix /path/to/steamapps/compatdata/<appid>/pfx")
+    listing = "\n".join(f"         {p}" for p in found)
+    raise SystemExit("error: several Proton prefixes match, please pick one:\n"
+                     f"{listing}\n"
+                     "       pass --prefix /path/to/.../pfx")
+
+
+def win_to_unix(prefix, winpath):
+    """Map a Windows path seen by the app ("Z:\\games\\") to a Linux path."""
+    m = re.match(r"^\s*([A-Za-z]):[\\/]*(.*)$", str(winpath or ""))
+    if not m:
+        return None
+    letter = m.group(1).lower()
+    link = None
+    for entry in os.listdir(Path(prefix) / "dosdevices"):
+        # wine creates lowercase "c:" / "z:" links, but be tolerant about case
+        if len(entry.rstrip(":")) == 1 and entry[0].lower() == letter and entry.endswith(":"):
+            link = Path(prefix) / "dosdevices" / entry
+            break
+    if link is None:
+        return None
+    try:
+        root = os.path.realpath(link)
+    except OSError:
+        return None
+    rest = m.group(2).replace("\\", "/").strip("/")
+    full = os.path.join(root, rest) if rest else root
+    # the download folder may not exist yet: measure its closest existing parent
+    while full != os.path.dirname(full) and not os.path.exists(full):
+        full = os.path.dirname(full)
+    return full if os.path.exists(full) else None
+
+
+def detect_download_path(prefix):
+    """Where the app will actually write downloads, according to its own config.
+
+    The app stores downloads outside the prefix by default (usually next to the
+    executable, through the Z: drive), which may live on a different filesystem
+    than the prefix.  Measuring the wrong one makes the check fail again.
+    """
+    pattern = os.path.join(str(prefix), "drive_c", "users", "*", "AppData", "Roaming",
+                           APP_DATA_MARKER, "downloads.data")
+    for cfg_path in glob.glob(pattern):
+        try:
+            with open(cfg_path, encoding="utf-8", errors="replace") as f:
+                cfg = json.load(f)
+        except (OSError, ValueError):
+            continue
+        win = cfg.get("defaultDir")
+        unix = win_to_unix(prefix, win)
+        if unix:
+            return unix, f"{win} (from downloads.data)"
+    return None, None
+
+
+def resolve_space_path(value, prefix, exe=None):
+    if not value:
+        value = os.environ.get("BD_SPACE_PATH")
+    if value:
+        path = os.path.abspath(os.path.expanduser(value))
+        if not os.path.exists(path):
+            raise SystemExit(f"error: --space-path does not exist: {path}")
+        return path, "--space-path"
+
+    detected, source = detect_download_path(prefix)
+    if detected:
+        return detected, source
+    # no remembered download folder yet: the app defaults to the game folder
+    if exe and os.path.isdir(os.path.dirname(exe)):
+        return os.path.dirname(exe), "folder of the executable (no downloads.data yet)"
+    return str(prefix / "drive_c"), "prefix drive_c"
+
+
+# --------------------------------------------------------------------------
+# main
+# --------------------------------------------------------------------------
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Fix Braindance's disk-space check under Wine/Proton.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  braindance-spacefix\n"
+            "  braindance-spacefix --exe ~/Games/Braindance/Braindance.exe\n"
+            "  braindance-spacefix --prefix ~/.local/share/Steam/steamapps/compatdata/123/pfx\n"
+            "  braindance-spacefix --space-path /mnt/games\n"
+            "  braindance-spacefix --revert\n\n"
+            "environment: BD_EXE, BD_PREFIX, BD_SPACE_PATH, BD_STEAM\n"
+            "backup:      <exe>.spacefix-backup (kept next to the executable)"
+        ),
+    )
+    ap.add_argument("--exe", help="path to Braindance.exe")
+    ap.add_argument("--prefix", help="Proton prefix dir (.../compatdata/<appid>/pfx)")
+    ap.add_argument("--space-path",
+                    help="Linux path whose filesystem is measured "
+                         "(default: the app's download folder, else <prefix>/drive_c)")
+    ap.add_argument("--steam", help="extra Steam installation/library root to search")
+    ap.add_argument("--revert", action="store_true", help="restore the unpatched executable")
+    ap.add_argument("--dry-run", action="store_true", help="do not write anything")
+    ap.add_argument("--quiet", action="store_true", help="only print errors")
+    args = ap.parse_args()
+
+    exe = resolve_exe(args.exe, args.steam)
+    backup = exe + BACKUP_SUFFIX
+
+    def say(*a):
+        if not args.quiet:
+            print(*a)
+
+    if not args.dry_run and app_running(exe):
+        raise SystemExit("error: Braindance is running, so its executable must not be "
+                         "modified now.\n       close the game and run this again.")
+
+    if args.revert:
+        if not os.path.exists(backup):
+            raise SystemExit(f"error: no backup found at {backup}")
+        if not args.dry_run:
+            shutil.copy2(backup, exe)
+        say(f"restored {exe}\nfrom     {backup}")
+        return
+
+    prefix = resolve_prefix(args.prefix, args.steam)
+    space_path, space_source = resolve_space_path(args.space_path, prefix, exe)
+
+    with open(exe, "rb") as f:
+        data = bytearray(f.read())
+    pe = PE(data, exe)
+
+    found = find_asset(pe, data)
+    if not found:
+        raise SystemExit(
+            f"error: {exe}\n"
+            "       this executable does not contain the expected disk-space wrappers.\n"
+            "       Either it is another app version, or it is already patched and its\n"
+            "       backup is missing. Use --revert first, or update this tool.")
+    entry_off, key, blob_off, blob_len, capacity, js_bytes = found
+    js = js_bytes.decode("utf-8", "surrogateescape")
+    already_patched = TAG_AVAIL.encode() in js_bytes
+
+    avail, total = df_bytes(space_path)
+
+    say(f"exe:    {exe}")
+    say(f"prefix: {prefix}")
+    say(f"space:  {space_path}  [{space_source}]")
+    say(f"asset:  {key.decode()}  ({blob_len}/{capacity} bytes compressed, {len(js)} bytes JS)")
+    say(f"disk:   {avail} bytes free / {total} bytes total "
+        f"({avail / 1024**3:.1f} / {total / 1024**3:.1f} GiB)")
+
+    if already_patched:
+        new_js, n1 = RE_PATCHED_AVAIL.subn(lambda m: "{return %d%s}" % (avail, TAG_AVAIL), js)
+        new_js, n2 = RE_PATCHED_TOTAL.subn(lambda m: "{return %d%s}" % (total, TAG_TOTAL), new_js)
+        if n1 != 1 or n2 != 1:
+            raise SystemExit(f"error: unexpected patched layout (available: {n1}, total: {n2})")
+        say("refreshing the stored numbers of an already patched executable")
+    else:
+        new_js, n1 = RE_AVAIL.subn(
+            lambda m: f"async function {m.group(1)}({m.group(2)}){{return {avail}{TAG_AVAIL}}}", js)
+        new_js, n2 = RE_TOTAL.subn(
+            lambda m: f"async function {m.group(1)}({m.group(2)}){{return {total}{TAG_TOTAL}}}", new_js)
+        if n1 != 1 or n2 != 1:
+            raise SystemExit(
+                f"error: unexpected bundle layout (available wrappers: {n1}, "
+                f"total wrappers: {n2}).\n"
+                "       This app version is probably not supported by this tool.")
+
+    say("wrappers: get_available_disk_space -> %d, get_total_disk_space -> %d" % (avail, total))
+
+    comp = brotli.compress(new_js.encode("utf-8", "surrogateescape"), quality=11)
+    if len(comp) > capacity:
+        raise SystemExit(f"error: recompressed asset ({len(comp)} bytes) does not fit "
+                         f"in its slot ({capacity} bytes)")
+
+    if args.dry_run:
+        say(f"dry run: recompressed to {len(comp)} bytes, nothing written")
+        return
+
+    # keep the backup pristine: only (re)create it when the binary is unpatched
+    if not already_patched:
+        try:
+            shutil.copy2(exe, backup)
+        except OSError as e:
+            raise SystemExit(f"error: could not write the backup {backup}: {e}\n"
+                             "       is the game running? close it and try again.")
+        say(f"backup: {backup}")
+
+    # only ever overwrite bytes that belonged to this same asset before
+    end = max(len(comp), min(blob_len, capacity))
+    data[blob_off:blob_off + end] = comp + b"\0" * (end - len(comp))
+    struct.pack_into("<Q", data, entry_off + 24, len(comp))  # asset datalen
+    try:
+        with open(exe, "wb") as f:
+            f.write(data)
+    except OSError as e:
+        if getattr(e, "errno", None) == 26:  # ETXTBSY: binary is executing
+            raise SystemExit("error: the game is running, so the executable cannot be "
+                             "rewritten.\n       close Braindance and run this again.")
+        raise SystemExit(f"error: could not write {exe}: {e}")
+
+    say(f"patched {exe} ({len(comp)} bytes)")
+    say("start the app and try the download again. Re-run this tool after an app "
+        "update or when your free space changes a lot.")
+
+
+if __name__ == "__main__":
+    main()
